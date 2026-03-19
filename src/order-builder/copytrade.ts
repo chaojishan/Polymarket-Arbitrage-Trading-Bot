@@ -929,6 +929,12 @@ export class CopytradeArbBot {
                     logger.info(`🔄 对冲完成，重置以开始新的对冲 (将使用环境变量阈值=${this.cfg.threshold})`);
                 }
             }
+            // CRITICAL: Reset attempt counters to allow new hedge to start
+            // Without this, maxAttemptsReached will always be true and the bot will be stuck
+            row.attemptCountYES = 0;
+            row.attemptCountNO = 0;
+            state[k] = row;
+            saveState(state);
             return;
         }
 
