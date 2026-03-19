@@ -6,6 +6,7 @@ import { ClobClient, OrderType, Side, type CreateOrderOptions, type UserOrder } 
 import { logger } from "../utils/logger";
 import { addHoldings } from "../utils/holdings";
 import { config } from "../config";
+import { checkConditionResolution } from "../utils/redeem";
 
 type CopytradeStateRow = {
     qtyYES: number; // UP shares
@@ -487,6 +488,95 @@ export class CopytradeArbBot {
     }
 
     /**
+     * Check and log settlement information for a previous market
+     */
+    private async checkMarketSettlement(prevSlug: string, market: string): Promise<void> {
+        try {
+            // Get state for previous market
+            const prevKey = keyForSlug(prevSlug);
+            const prevLegacyKey = legacyKeyForSlug(prevSlug);
+            const prevRow = this.state[prevKey] ?? this.state[prevLegacyKey];
+            
+            if (!prevRow || !prevRow.conditionId) {
+                // No state or conditionId for previous market, skip settlement check
+                return;
+            }
+
+            const conditionId = prevRow.conditionId;
+            const qtyYES = prevRow.qtyYES || 0;
+            const qtyNO = prevRow.qtyNO || 0;
+            const costYES = prevRow.costYES || 0;
+            const costNO = prevRow.costNO || 0;
+            const totalCost = costYES + costNO;
+            const totalShares = qtyYES + qtyNO;
+
+            // Skip if no positions
+            if (totalShares === 0 || totalCost === 0) {
+                return;
+            }
+
+            // Check if market is resolved
+            const resolution = await checkConditionResolution(conditionId);
+            
+            if (!resolution.isResolved) {
+                // Market not yet resolved
+                logger.info(
+                    `📊 市场结算检查: slug=${prevSlug} 市场=${market} ` +
+                    `持仓: YES=${qtyYES.toFixed(4)} NO=${qtyNO.toFixed(4)} ` +
+                    `成本: $${totalCost.toFixed(4)} | 状态: 未结算`
+                );
+                return;
+            }
+
+            // Market is resolved - calculate PnL
+            const denom = Number(resolution.payoutDenominator.toString());
+            const upIdx = Number.isFinite(Number(prevRow.upIdx)) ? Number(prevRow.upIdx) : 0;
+            const downIdx = Number.isFinite(Number(prevRow.downIdx)) ? Number(prevRow.downIdx) : 1;
+            const upNum = Number(resolution.payoutNumerators[upIdx]?.toString() ?? "0");
+            const downNum = Number(resolution.payoutNumerators[downIdx]?.toString() ?? "0");
+            const upRatio = denom > 0 ? upNum / denom : 0;
+            const downRatio = denom > 0 ? downNum / denom : 0;
+
+            const payout = qtyYES * upRatio + qtyNO * downRatio;
+            const pnl = payout - totalCost;
+            const roi = totalCost > 0 ? (pnl / totalCost) * 100 : 0;
+
+            // Determine winning side
+            let winningSide = "无";
+            if (upRatio > 0 && downRatio === 0) {
+                winningSide = "YES (Up)";
+            } else if (downRatio > 0 && upRatio === 0) {
+                winningSide = "NO (Down)";
+            } else if (upRatio > 0 && downRatio > 0) {
+                winningSide = "平局";
+            }
+
+            // Log settlement information
+            logger.info(`\n${"=".repeat(50)}`);
+            logger.info(`💰 市场结算信息: slug=${prevSlug} 市场=${market}`);
+            logger.info(`${"=".repeat(50)}`);
+            logger.info(`📊 持仓情况:`);
+            logger.info(`   YES (Up): ${qtyYES.toFixed(4)} 份额 (成本: $${costYES.toFixed(4)})`);
+            logger.info(`   NO (Down): ${qtyNO.toFixed(4)} 份额 (成本: $${costNO.toFixed(4)})`);
+            logger.info(`   总持仓: ${totalShares.toFixed(4)} 份额`);
+            logger.info(`   总成本: $${totalCost.toFixed(4)}`);
+            logger.info(`\n🎯 结算结果:`);
+            logger.info(`   获胜方: ${winningSide}`);
+            logger.info(`   获胜指数集: ${resolution.winningIndexSets.join(", ")}`);
+            logger.info(`   YES 赔付比例: ${(upRatio * 100).toFixed(2)}%`);
+            logger.info(`   NO 赔付比例: ${(downRatio * 100).toFixed(2)}%`);
+            logger.info(`\n💵 盈亏情况:`);
+            logger.info(`   赔付金额: $${payout.toFixed(4)}`);
+            logger.info(`   盈亏 (PnL): $${pnl.toFixed(4)} ${pnl >= 0 ? "✅" : "❌"}`);
+            logger.info(`   收益率 (ROI): ${roi.toFixed(2)}%`);
+            logger.info(`${"=".repeat(50)}\n`);
+        } catch (error) {
+            // Don't block execution if settlement check fails
+            logger.warn(`检查市场结算信息失败 slug=${prevSlug} 市场=${market}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    /**
      * Cancel stale orders that haven't filled
      */
     private async cancelStaleOrders(): Promise<void> {
@@ -859,6 +949,10 @@ export class CopytradeArbBot {
         if (prevSlug && prevSlug !== slug) {
             logger.info(`\n\n==================================================\n`);
             logger.info(`🔄 新的15分钟市场周期: 市场=${market} slug=${slug}`);
+            
+            // Check settlement information for previous market (fire-and-forget)
+            void this.checkMarketSettlement(prevSlug, market);
+            
             // Reset tracking state for new market
             delete this.trackingBySlug[prevSlug];
             // Clear safety check logs for old slug (allow logging again for new market)
