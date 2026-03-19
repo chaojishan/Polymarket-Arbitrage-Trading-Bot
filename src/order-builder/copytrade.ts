@@ -72,6 +72,9 @@ type HedgedArbConfig = {
     orderCheckMaxAttempts: number; // Max order check attempts
     // State management
     cleanupOldStateDays: number; // Clean up state older than N days
+    // Simulation / paper-trading
+    simulate: boolean; // If true, do not place real orders, only simulate
+    simInitialBalanceUsdc: number; // Virtual starting balance used in simulation
 };
 
 const NEW_STATE_FILE = "src/data/copytrade-state.json";
@@ -158,7 +161,7 @@ function loadState(): CopytradeStateFile {
             return normalizeState(JSON.parse(raw));
         }
     } catch (e) {
-        logger.warn(`Failed to read copytrade state: ${e instanceof Error ? e.message : String(e)}`);
+        logger.warn(`读取套利状态失败: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     // Fallback: read legacy gabagool state and migrate in-memory.
@@ -176,7 +179,7 @@ function loadState(): CopytradeStateFile {
         }
         return migrated;
     } catch (e) {
-        logger.warn(`Failed to read legacy state: ${e instanceof Error ? e.message : String(e)}`);
+        logger.warn(`读取旧状态失败: ${e instanceof Error ? e.message : String(e)}`);
         return {};
     }
 }
@@ -204,7 +207,7 @@ function saveState(state: CopytradeStateFile): void {
                 await writeFileAsync(p, JSON.stringify(pendingState, null, 2), "utf8");
             } catch (e) {
                 // Only log errors, don't block execution
-                logger.warn(`Failed to write copytrade state: ${e instanceof Error ? e.message : String(e)}`);
+                logger.warn(`写入套利状态失败: ${e instanceof Error ? e.message : String(e)}`);
             }
             pendingState = null;
         }
@@ -278,6 +281,10 @@ type BotMetrics = {
     startTime: number;
     errors: number;
     apiErrors: number;
+    // Simulation metrics
+    simInitialBalance: number;
+    simCurrentBalance: number;
+    simLockedProfit: number; // Sum of theoretical locked-in profit from completed hedges
 };
 
 export class CopytradeArbBot {
@@ -323,28 +330,37 @@ export class CopytradeArbBot {
     /**
      * Bot metrics for monitoring
      */
-    private metrics: BotMetrics = {
-        totalOrders: 0,
-        successfulOrders: 0,
-        failedOrders: 0,
-        totalSpent: 0,
-        totalReceived: 0,
-        avgSumAvg: 0,
-        sumAvgSamples: 0,
-        lastBalanceCheck: 0,
-        lastBalance: 0,
-        startTime: Date.now(),
-        errors: 0,
-        apiErrors: 0,
-    };
+    private metrics: BotMetrics;
 
     /**
-     * Track initial balance for drawdown calculation
+     * Track initial balance for drawdown calculation (real mode) or simulation
      */
     private initialBalance: number = 0;
     private isStopped: boolean = false;
+    private readonly isSimulation: boolean;
 
     constructor(private client: ClobClient, private cfg: HedgedArbConfig) {
+        this.isSimulation = cfg.simulate;
+
+        // Initialize metrics (need cfg to set simulation fields)
+        this.metrics = {
+            totalOrders: 0,
+            successfulOrders: 0,
+            failedOrders: 0,
+            totalSpent: 0,
+            totalReceived: 0,
+            avgSumAvg: 0,
+            sumAvgSamples: 0,
+            lastBalanceCheck: 0,
+            lastBalance: 0,
+            startTime: Date.now(),
+            errors: 0,
+            apiErrors: 0,
+            simInitialBalance: cfg.simInitialBalanceUsdc,
+            simCurrentBalance: cfg.simInitialBalanceUsdc,
+            simLockedProfit: 0,
+        };
+
         // Validate configuration on startup
         this.validateConfig();
         // Clean up old state
@@ -358,23 +374,23 @@ export class CopytradeArbBot {
         const warnings: string[] = [];
 
         if (this.cfg.maxSumAvg >= 1.0) {
-            warnings.push(`⚠️ TRADE_MAX_SUM_AVG (${this.cfg.maxSumAvg}) is >= 1.0, which means no profitable trades will be allowed!`);
+            warnings.push(`⚠️ TRADE_MAX_SUM_AVG (${this.cfg.maxSumAvg}) >= 1.0, 这意味着不会允许任何盈利交易！`);
         }
 
         if (this.cfg.maxSumAvg < 0.9) {
-            warnings.push(`⚠️ TRADE_MAX_SUM_AVG (${this.cfg.maxSumAvg}) is very low, may skip many trades`);
+            warnings.push(`⚠️ TRADE_MAX_SUM_AVG (${this.cfg.maxSumAvg}) 非常低，可能会跳过许多交易`);
         }
 
         if (this.cfg.sharesPerSide < 1) {
-            warnings.push(`⚠️ TRADE_SHARES (${this.cfg.sharesPerSide}) is less than 1`);
+            warnings.push(`⚠️ TRADE_SHARES (${this.cfg.sharesPerSide}) 小于 1`);
         }
 
         if (this.cfg.minBalanceUsdc < 1) {
-            warnings.push(`⚠️ TRADE_MIN_BALANCE_USDC (${this.cfg.minBalanceUsdc}) is less than $1, may cause issues`);
+            warnings.push(`⚠️ TRADE_MIN_BALANCE_USDC (${this.cfg.minBalanceUsdc}) 小于 $1，可能会导致问题`);
         }
 
         if (this.cfg.maxDrawdownPercent > 0 && this.cfg.maxDrawdownPercent > 100) {
-            warnings.push(`⚠️ TRADE_MAX_DRAWDOWN_PERCENT (${this.cfg.maxDrawdownPercent}) is > 100%`);
+            warnings.push(`⚠️ TRADE_MAX_DRAWDOWN_PERCENT (${this.cfg.maxDrawdownPercent}) > 100%`);
         }
 
         if (this.cfg.minPollMs >= this.cfg.maxPollMs) {
@@ -383,7 +399,7 @@ export class CopytradeArbBot {
 
         if (warnings.length > 0) {
             logger.warn("═══════════════════════════════════════");
-            logger.warn("⚠️  CONFIGURATION WARNINGS");
+            logger.warn("⚠️  配置警告");
             logger.warn("═══════════════════════════════════════");
             warnings.forEach(w => logger.warn(w));
             logger.warn("═══════════════════════════════════════");
@@ -411,7 +427,7 @@ export class CopytradeArbBot {
 
         if (cleaned > 0) {
             saveState(this.state);
-            logger.info(`🧹 Cleaned up ${cleaned} old state entries (older than ${this.cfg.cleanupOldStateDays} days)`);
+            logger.info(`🧹 已清理 ${cleaned} 个旧状态条目 (超过 ${this.cfg.cleanupOldStateDays} 天)`);
         }
     }
 
@@ -420,11 +436,19 @@ export class CopytradeArbBot {
      */
     private async checkBalanceAndDrawdown(): Promise<boolean> {
         try {
-            const { getAvailableBalance } = await import("../utils/balance");
-            const { AssetType } = await import("@polymarket/clob-client");
+            let availableUsdc: number;
 
-            const available = await getAvailableBalance(this.client, AssetType.COLLATERAL);
-            const availableUsdc = available / 10 ** 6;
+            if (this.isSimulation) {
+                // In simulation mode, derive "available" from virtual balance
+                // Use current simulated balance as available
+                availableUsdc = this.metrics.simCurrentBalance;
+            } else {
+                const { getAvailableBalance } = await import("../utils/balance");
+                const { AssetType } = await import("@polymarket/clob-client");
+
+                const available = await getAvailableBalance(this.client, AssetType.COLLATERAL);
+                availableUsdc = available / 10 ** 6;
+            }
 
             this.metrics.lastBalanceCheck = Date.now();
             this.metrics.lastBalance = availableUsdc;
@@ -432,12 +456,14 @@ export class CopytradeArbBot {
             // Set initial balance on first check
             if (this.initialBalance === 0) {
                 this.initialBalance = availableUsdc;
-                logger.info(`💰 Initial balance: $${availableUsdc.toFixed(2)}`);
+                logger.info(
+                    `${this.isSimulation ? "💰 [模拟]" : "💰"} 初始余额: $${availableUsdc.toFixed(2)}`
+                );
             }
 
             // Check minimum balance
             if (availableUsdc < this.cfg.minBalanceUsdc) {
-                logger.error(`🛑 Balance too low: $${availableUsdc.toFixed(2)} < $${this.cfg.minBalanceUsdc}. Stopping bot.`);
+                logger.error(`🛑 余额过低: $${availableUsdc.toFixed(2)} < $${this.cfg.minBalanceUsdc}。停止机器人。`);
                 this.stop();
                 return false;
             }
@@ -446,7 +472,7 @@ export class CopytradeArbBot {
             if (this.cfg.maxDrawdownPercent > 0 && this.initialBalance > 0) {
                 const drawdown = ((this.initialBalance - availableUsdc) / this.initialBalance) * 100;
                 if (drawdown > this.cfg.maxDrawdownPercent) {
-                    logger.error(`🛑 Max drawdown exceeded: ${drawdown.toFixed(2)}% > ${this.cfg.maxDrawdownPercent}%. Stopping bot.`);
+                    logger.error(`🛑 超过最大回撤: ${drawdown.toFixed(2)}% > ${this.cfg.maxDrawdownPercent}%。停止机器人。`);
                     this.stop();
                     return false;
                 }
@@ -455,7 +481,7 @@ export class CopytradeArbBot {
             return true;
         } catch (error) {
             this.metrics.errors++;
-            logger.warn(`Failed to check balance: ${error instanceof Error ? error.message : String(error)}`);
+            logger.warn(`检查余额失败: ${error instanceof Error ? error.message : String(error)}`);
             return true; // Continue on error
         }
     }
@@ -477,7 +503,7 @@ export class CopytradeArbBot {
 
         if (staleOrders.length === 0) return;
 
-        logger.info(`🔄 Cancelling ${staleOrders.length} stale order(s)...`);
+        logger.info(`🔄 正在取消 ${staleOrders.length} 个过期订单...`);
 
         for (const orderID of staleOrders) {
             try {
@@ -486,14 +512,14 @@ export class CopytradeArbBot {
                 if (order && order.status === "LIVE") {
                     await this.client.cancelOrder({ orderID } as any); // cancelOrder expects OrderPayload
                     this.openOrders.delete(orderID);
-                    logger.info(`✅ Cancelled stale order: ${orderID.substring(0, 20)}...`);
+                    logger.info(`✅ 已取消过期订单: ${orderID.substring(0, 20)}...`);
                 } else {
                     // Order already filled or cancelled, remove from tracking
                     this.openOrders.delete(orderID);
                 }
             } catch (error) {
                 this.metrics.errors++;
-                logger.warn(`Failed to cancel order ${orderID.substring(0, 20)}...: ${error instanceof Error ? error.message : String(error)}`);
+                logger.warn(`取消订单失败 ${orderID.substring(0, 20)}...: ${error instanceof Error ? error.message : String(error)}`);
                 // Remove from tracking even if cancel failed (might already be filled)
                 this.openOrders.delete(orderID);
             }
@@ -599,11 +625,11 @@ export class CopytradeArbBot {
                             this.metrics.sumAvgSamples++;
 
                             // PERFORMANCE: Only calculate savings info in DEBUG mode
-                            let logMsg = `✅ Async order MATCHED: ${orderID.substring(0, 20)}... leg=${leg} filled=${tokensReceived} spent=${usdcSpent.toFixed(6)} sumAvg=${currentSumAvg.toFixed(4)}`;
+                            let logMsg = `✅ 异步订单已匹配: ${orderID.substring(0, 20)}... 边=${leg} 成交=${tokensReceived} 花费=${usdcSpent.toFixed(6)} 总平均=${currentSumAvg.toFixed(4)}`;
                             if (config.debug) {
                                 const priceDiff = Math.abs(actualFillPrice - limitPrice);
                                 if (priceDiff > 0.001) {
-                                    logMsg += ` (actual: ${actualFillPrice.toFixed(4)} vs limit: ${limitPrice.toFixed(4)}, saved ${priceDiff.toFixed(4)})`;
+                                    logMsg += ` (实际: ${actualFillPrice.toFixed(4)} vs 限价: ${limitPrice.toFixed(4)}, 节省 ${priceDiff.toFixed(4)})`;
                                 }
                             }
 
@@ -630,12 +656,12 @@ export class CopytradeArbBot {
 
                 // Order not matched yet or failed - log but don't block
                 if (order) {
-                    logger.warn(`Async order ${orderID.substring(0, 20)}... status=${order.status} after ${attempts + 1} attempts`);
+                    logger.warn(`异步订单 ${orderID.substring(0, 20)}... 状态=${order.status} 尝试 ${attempts + 1} 次后`);
                 } else {
-                    logger.warn(`Async order ${orderID.substring(0, 20)}... could not verify after ${attempts + 1} attempts`);
+                    logger.warn(`异步订单 ${orderID.substring(0, 20)}... 尝试 ${attempts + 1} 次后无法验证`);
                 }
             } catch (error) {
-                logger.warn(`Async order tracking failed for ${orderID.substring(0, 20)}...: ${error instanceof Error ? error.message : String(error)}`);
+                logger.warn(`异步订单跟踪失败 ${orderID.substring(0, 20)}...: ${error instanceof Error ? error.message : String(error)}`);
             }
         })();
     }
@@ -646,7 +672,7 @@ export class CopytradeArbBot {
     private stop(): void {
         if (this.isStopped) return;
         this.isStopped = true;
-        logger.error("🛑 Bot stopped due to safety check");
+        logger.error(this.isSimulation ? "🛑 [模拟] 机器人因安全检查已停止" : "🛑 机器人因安全检查已停止");
         this.logMetrics();
     }
 
@@ -663,16 +689,26 @@ export class CopytradeArbBot {
             : "0.0000";
 
         logger.info("═══════════════════════════════════════");
-        logger.info("📊 BOT METRICS");
+        logger.info(this.isSimulation ? "📊 机器人指标 [模拟模式]" : "📊 机器人指标");
         logger.info("═══════════════════════════════════════");
-        logger.info(`Total Orders: ${this.metrics.totalOrders}`);
-        logger.info(`Successful: ${this.metrics.successfulOrders} (${successRate}%)`);
-        logger.info(`Failed: ${this.metrics.failedOrders}`);
-        logger.info(`Avg SumAvg: ${avgSumAvg}`);
-        logger.info(`Total Spent: $${this.metrics.totalSpent.toFixed(2)}`);
-        logger.info(`Current Balance: $${this.metrics.lastBalance.toFixed(2)}`);
-        logger.info(`Errors: ${this.metrics.errors} (API: ${this.metrics.apiErrors})`);
-        logger.info(`Uptime: ${uptime}s`);
+        logger.info(`总订单数: ${this.metrics.totalOrders}`);
+        logger.info(`成功: ${this.metrics.successfulOrders} (${successRate}%)`);
+        logger.info(`失败: ${this.metrics.failedOrders}`);
+        logger.info(`平均总成本: ${avgSumAvg}`);
+        logger.info(`总支出: $${this.metrics.totalSpent.toFixed(2)}`);
+        logger.info(`当前余额: $${this.metrics.lastBalance.toFixed(2)}`);
+        if (this.isSimulation) {
+            const simPnL = this.metrics.simCurrentBalance - this.metrics.simInitialBalance;
+            const simRoi = this.metrics.simInitialBalance > 0
+                ? (simPnL / this.metrics.simInitialBalance) * 100
+                : 0;
+            logger.info(`模拟初始余额: $${this.metrics.simInitialBalance.toFixed(2)}`);
+            logger.info(`模拟当前余额: $${this.metrics.simCurrentBalance.toFixed(2)}`);
+            logger.info(`模拟锁定利润 (理论): $${this.metrics.simLockedProfit.toFixed(2)}`);
+            logger.info(`模拟盈亏 (基于余额): $${simPnL.toFixed(2)} (${simRoi.toFixed(2)}%)`);
+        }
+        logger.info(`错误数: ${this.metrics.errors} (API: ${this.metrics.apiErrors})`);
+        logger.info(`运行时间: ${uptime}秒`);
         logger.info("═══════════════════════════════════════");
     }
 
@@ -684,7 +720,7 @@ export class CopytradeArbBot {
             maxDrawdownPercent, minBalanceUsdc,
             adaptivePolling, minPollMs, maxPollMs,
             orderCheckInitialDelayMs, orderCheckRetryDelayMs, orderCheckMaxAttempts,
-            cleanupOldStateDays
+            cleanupOldStateDays, simulate, simInitialBalanceUsdc
         } = config.copytrade;
         return new CopytradeArbBot(client, {
             markets,
@@ -716,6 +752,8 @@ export class CopytradeArbBot {
             orderCheckRetryDelayMs,
             orderCheckMaxAttempts,
             cleanupOldStateDays,
+            simulate,
+            simInitialBalanceUsdc,
         });
     }
 
@@ -778,7 +816,7 @@ export class CopytradeArbBot {
         setTimeout(scheduleNextTick, currentPollMs);
 
         logger.info(
-            `CopytradeArbBot started markets=${this.cfg.markets.join(",")} pollMs=${this.cfg.pollMs}${this.cfg.adaptivePolling ? " (adaptive)" : ""}`
+            `套利机器人已启动 市场=${this.cfg.markets.join(",")} 轮询间隔=${this.cfg.pollMs}ms${this.cfg.adaptivePolling ? " (自适应)" : ""}`
         );
     }
 
@@ -799,14 +837,14 @@ export class CopytradeArbBot {
         const startedAt = Date.now();
         const warnTimer = setTimeout(() => {
             logger.warn(
-                `Copytrade market tick taking long: market=${market} elapsedMs=${Date.now() - startedAt}`
+                `套利市场轮询耗时较长: 市场=${market} 已耗时=${Date.now() - startedAt}毫秒`
             );
         }, warnAfterMs);
 
         try {
             await this.tickMarket(market);
         } catch (e) {
-            logger.error(`Copytrade tickMarket failed market=${market}`, e as any);
+            logger.error(`套利市场轮询失败 市场=${market}`, e as any);
         } finally {
             clearTimeout(warnTimer);
             this.runningByMarket[market] = false;
@@ -820,7 +858,7 @@ export class CopytradeArbBot {
         // Detect new market cycle
         if (prevSlug && prevSlug !== slug) {
             logger.info(`\n\n==================================================\n`);
-            logger.info(`🔄 New 15m market cycle: market=${market} slug=${slug}`);
+            logger.info(`🔄 新的15分钟市场周期: 市场=${market} slug=${slug}`);
             // Reset tracking state for new market
             delete this.trackingBySlug[prevSlug];
             // Clear safety check logs for old slug (allow logging again for new market)
@@ -830,7 +868,7 @@ export class CopytradeArbBot {
             // Clear flexible entry logs for old slug (allow logging again for new market)
             this.flexibleEntryLoggedSlugs.delete(prevSlug);
         } else if (!prevSlug) {
-            logger.info(`Market cycle initialized: market=${market} slug=${slug}`);
+            logger.info(`市场周期已初始化: 市场=${market} slug=${slug}`);
         }
         this.lastSlugByMarket[market] = slug;
 
@@ -863,10 +901,16 @@ export class CopytradeArbBot {
         if (maxAttemptsReached) {
             const avgYes = avg(row.costYES, row.qtyYES);
             const avgNo = avg(row.costNO, row.qtyNO);
+            const sumAvg = avgYes + avgNo;
+            const totalShares = row.qtyYES + row.qtyNO;
+            if (this.isSimulation && totalShares > 0 && sumAvg > 0 && sumAvg < 1.0) {
+                const locked = totalShares * (1 - sumAvg);
+                this.metrics.simLockedProfit += locked;
+            }
             if (!this.hedgedLoggedSlugs.has(slug)) {
                 this.hedgedLoggedSlugs.add(slug);
                 logger.info(
-                    `✅ Hedge complete: market=${market} slug=${slug} attempts=${row.attemptCountYES}Y/${row.attemptCountNO}N successful=${row.buyCountYES}Y/${row.buyCountNO}N avgYES=${avgYes.toFixed(4)} avgNO=${avgNo.toFixed(4)} sumAvg=${(avgYes + avgNo).toFixed(4)}`
+                    `✅ 对冲完成: 市场=${market} slug=${slug} 尝试次数=${row.attemptCountYES}Y/${row.attemptCountNO}N 成功=${row.buyCountYES}Y/${row.buyCountNO}N 平均YES=${avgYes.toFixed(4)} 平均NO=${avgNo.toFixed(4)} 总平均=${(avgYes + avgNo).toFixed(4)}`
                 );
             }
             // Reset tracking for new hedge - will start fresh with ENV threshold
@@ -882,7 +926,7 @@ export class CopytradeArbBot {
                 // Only log reset message once per hedge completion
                 if (!this.hedgeResetLoggedSlugs.has(slug)) {
                     this.hedgeResetLoggedSlugs.add(slug);
-                    logger.info(`🔄 Hedge complete, resetting for new hedge (will use ENV threshold=${this.cfg.threshold})`);
+                    logger.info(`🔄 对冲完成，重置以开始新的对冲 (将使用环境变量阈值=${this.cfg.threshold})`);
                 }
             }
             return;
@@ -916,7 +960,7 @@ export class CopytradeArbBot {
                 // Neither token is below threshold yet, wait
                 // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled
                 if (config.debug) {
-                    logger.debug(`⏳ Waiting for entry (new hedge): market=${market} YES=${upMid.toFixed(4)} NO=${downMid.toFixed(4)} threshold=${this.cfg.threshold}`);
+                    logger.debug(`⏳ 等待入场 (新对冲): 市场=${market} YES=${upMid.toFixed(4)} NO=${downMid.toFixed(4)} 阈值=${this.cfg.threshold}`);
                 }
                 return;
             }
@@ -929,19 +973,19 @@ export class CopytradeArbBot {
             let selectedToken: "YES" | "NO";
             if (row.lastBuySide === "YES" && yesBelow) {
                 selectedToken = "YES";
-                logger.info(`🎯 New hedge entry (flexible): Last buy was YES, YES below threshold (${upMid.toFixed(4)} ≤ ${this.cfg.threshold}), starting with YES`);
+                logger.info(`🎯 新对冲入场 (灵活): 上次买入是 YES, YES 低于阈值 (${upMid.toFixed(4)} ≤ ${this.cfg.threshold}), 从 YES 开始`);
             } else if (row.lastBuySide === "NO" && noBelow) {
                 selectedToken = "NO";
-                logger.info(`🎯 New hedge entry (flexible): Last buy was NO, NO below threshold (${downMid.toFixed(4)} ≤ ${this.cfg.threshold}), starting with NO`);
+                logger.info(`🎯 新对冲入场 (灵活): 上次买入是 NO, NO 低于阈值 (${downMid.toFixed(4)} ≤ ${this.cfg.threshold}), 从 NO 开始`);
             } else if (yesBelow && noBelow) {
                 selectedToken = "YES"; // Default priority if both below
-                logger.info(`🎯 New hedge entry (flexible): Both below threshold, starting with YES (priority) price=${upMid.toFixed(4)}`);
+                logger.info(`🎯 新对冲入场 (灵活): 两者都低于阈值，从 YES 开始 (优先) 价格=${upMid.toFixed(4)}`);
             } else if (yesBelow) {
                 selectedToken = "YES";
-                logger.info(`🎯 New hedge entry (flexible): YES below threshold, starting with YES price=${upMid.toFixed(4)}`);
+                logger.info(`🎯 新对冲入场 (灵活): YES 低于阈值，从 YES 开始 价格=${upMid.toFixed(4)}`);
             } else {
                 selectedToken = "NO";
-                logger.info(`🎯 New hedge entry (flexible): NO below threshold, starting with NO price=${downMid.toFixed(4)}`);
+                logger.info(`🎯 新对冲入场 (灵活): NO 低于阈值，从 NO 开始 价格=${downMid.toFixed(4)}`);
             }
 
             tracking.trackingToken = selectedToken;
@@ -957,7 +1001,7 @@ export class CopytradeArbBot {
             if (!yesBelow && !noBelow) {
                 // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled
                 if (config.debug) {
-                    logger.debug(`⏳ Waiting for entry: market=${market} YES=${upMid.toFixed(4)} NO=${downMid.toFixed(4)} threshold=${this.cfg.threshold}`);
+                    logger.debug(`⏳ 等待入场: 市场=${market} YES=${upMid.toFixed(4)} NO=${downMid.toFixed(4)} 阈值=${this.cfg.threshold}`);
                 }
                 return;
             }
@@ -965,15 +1009,15 @@ export class CopytradeArbBot {
             if (yesBelow && noBelow) {
                 tracking.trackingToken = "YES";
                 tracking.tempPrice = upMid;
-                logger.info(`🎯 Entry signal: Both below threshold, tracking YES first (priority) price=${upMid.toFixed(4)}`);
+                logger.info(`🎯 入场信号: 两者都低于阈值，优先跟踪 YES 价格=${upMid.toFixed(4)}`);
             } else if (yesBelow) {
                 tracking.trackingToken = "YES";
                 tracking.tempPrice = upMid;
-                logger.info(`🎯 Entry signal: YES below threshold, tracking YES price=${upMid.toFixed(4)}`);
+                logger.info(`🎯 入场信号: YES 低于阈值，跟踪 YES 价格=${upMid.toFixed(4)}`);
             } else {
                 tracking.trackingToken = "NO";
                 tracking.tempPrice = downMid;
-                logger.info(`🎯 Entry signal: NO below threshold, tracking NO price=${downMid.toFixed(4)}`);
+                logger.info(`🎯 入场信号: NO 低于阈值，跟踪 NO 价格=${downMid.toFixed(4)}`);
             }
             tracking.initialized = true;
             tracking.firstBuyOfHedge = true;
@@ -1000,7 +1044,7 @@ export class CopytradeArbBot {
                 // Only log once per slug to avoid spam
                 if (!this.flexibleEntryLoggedSlugs.has(slug)) {
                     this.flexibleEntryLoggedSlugs.add(slug);
-                    logger.info(`✅ First buy of new hedge: Allowing ${currentToken} (flexible entry strategy, last buy was also ${currentToken})`);
+                    logger.info(`✅ 新对冲的首次买入: 允许 ${currentToken} (灵活入场策略，上次买入也是 ${currentToken})`);
                 }
             } else {
                 // After first buy: Enforce strict alternation to maintain hedge balance
@@ -1011,7 +1055,7 @@ export class CopytradeArbBot {
 
                 // Switch to opposite token to continue building hedge
                 // The top-level check will stop when BOTH sides reach max attempts
-                logger.warn(`⚠️ Safety check: Last buy was ${currentToken}, enforcing alternation - switching to ${oppositeToken}`);
+                logger.warn(`⚠️ 安全检查: 上次买入是 ${currentToken}，强制交替 - 切换到 ${oppositeToken}`);
                 tracking.trackingToken = oppositeToken;
                 tracking.tempPrice = oppositePrice;
                 tracking.secondSideTimerSessionStart = null;
@@ -1034,7 +1078,7 @@ export class CopytradeArbBot {
             }
 
             // Switch to opposite token to continue building hedge
-            logger.info(`🔄 ${currentToken} side reached max attempts (${attemptCount}/${this.cfg.maxBuysPerSide}), switching to ${oppositeToken} @ ${oppositePrice.toFixed(4)}`);
+            logger.info(`🔄 ${currentToken} 边已达到最大尝试次数 (${attemptCount}/${this.cfg.maxBuysPerSide})，切换到 ${oppositeToken} @ ${oppositePrice.toFixed(4)}`);
             tracking.trackingToken = oppositeToken;
             tracking.tempPrice = oppositePrice;
             tracking.secondSideTimerSessionStart = null;
@@ -1059,13 +1103,13 @@ export class CopytradeArbBot {
             if (config.debug) {
                 if (isAcceptable) {
                     logger.info(
-                        `📉 Price DROP: ${currentToken} ${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)} ` +
-                        `(temp updated ✅, max acceptable: ${maxAcceptablePrice.toFixed(4)}, current sumAvg: ${(currentAvgYES + currentAvgNO).toFixed(4)})`
+                        `📉 价格下跌: ${currentToken} ${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)} ` +
+                        `(临时价格已更新 ✅, 最大可接受: ${maxAcceptablePrice.toFixed(4)}, 当前总平均: ${(currentAvgYES + currentAvgNO).toFixed(4)})`
                     );
                 } else {
                     logger.info(
-                        `📉 Price DROP but still too high: ${currentToken} ${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)} ` +
-                        `(temp updated, max acceptable: ${maxAcceptablePrice.toFixed(4)}, waiting for price ≤ ${maxAcceptablePrice.toFixed(4)})`
+                        `📉 价格下跌但仍过高: ${currentToken} ${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)} ` +
+                        `(临时价格已更新, 最大可接受: ${maxAcceptablePrice.toFixed(4)}, 等待价格 ≤ ${maxAcceptablePrice.toFixed(4)})`
                     );
                 }
             }
@@ -1095,7 +1139,7 @@ export class CopytradeArbBot {
                 if (tracking.secondSideTimerSessionStart !== null) {
                     tracking.secondSideTimerSessionStart = null;
                     if (config.debug) {
-                        logger.debug(`📊 Second side: Price ${currentPrice.toFixed(4)} > threshold ${dynamicThreshold.toFixed(4)}, resetting timer`);
+                        logger.debug(`📊 第二边: 价格 ${currentPrice.toFixed(4)} > 阈值 ${dynamicThreshold.toFixed(4)}，重置计时器`);
                     }
                 }
                 timeBelowThreshold = 0;
@@ -1105,7 +1149,7 @@ export class CopytradeArbBot {
                     // Start timer when price first goes below threshold
                     tracking.secondSideTimerSessionStart = now;
                     if (config.debug) {
-                        logger.debug(`📊 Second side: Price ${currentPrice.toFixed(4)} <= threshold ${dynamicThreshold.toFixed(4)}, starting continuous timer`);
+                        logger.debug(`📊 第二边: 价格 ${currentPrice.toFixed(4)} <= 阈值 ${dynamicThreshold.toFixed(4)}，开始连续计时器`);
                     }
                 }
                 // Calculate continuous time (wall-clock time since timer started)
@@ -1146,8 +1190,8 @@ export class CopytradeArbBot {
             // SPEED OPTIMIZATION: Mark opportunity for aggressive polling
             this.lastOpportunityTime = opportunityDetectedAt;
             logger.success(
-                `🎯 SECOND BUY (Time-based): ${currentToken} @ ${currentPrice.toFixed(4)} | Price <= threshold ${tracking.tempPrice.toFixed(4)} for ${timeBelowThreshold}ms (>= ${this.cfg.secondSideTimeThresholdMs}ms) ` +
-                `attempt_count=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
+                `🎯 第二次买入 (基于时间): ${currentToken} @ ${currentPrice.toFixed(4)} | 价格 <= 阈值 ${tracking.tempPrice.toFixed(4)} 持续 ${timeBelowThreshold}毫秒 (>= ${this.cfg.secondSideTimeThresholdMs}毫秒) ` +
+                `尝试次数=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
             );
 
             // Get state before buy to check if it succeeded
@@ -1177,7 +1221,7 @@ export class CopytradeArbBot {
             const buyCountAfter = currentToken === "YES" ? rowAfter.buyCountYES : rowAfter.buyCountNO;
             const buySucceeded = buyCountAfter > buyCountBefore;
 
-            logger.info(`⏱️ Execution timing: buy=${buyTime}ms total=${totalExecutionTime}ms success=${buySucceeded}`);
+            logger.info(`⏱️ 执行时间: 买入=${buyTime}毫秒 总计=${totalExecutionTime}毫秒 成功=${buySucceeded}`);
 
             // Reset time tracking after buy attempt
             tracking.secondSideTimerSessionStart = null;
@@ -1202,12 +1246,12 @@ export class CopytradeArbBot {
                     tracking.firstBuyOfHedge = false;
                     // Clear reset log tracking for this slug - new hedge has started
                     this.hedgeResetLoggedSlugs.delete(slug);
-                    logger.success(`🎯 FIRST BUY: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | Hedge started`);
+                    logger.success(`🎯 首次买入: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | 对冲已开始`);
                 }
                 const dynamicThreshold = 1 - actualBuyPrice + this.cfg.dynamicThresholdBoost; // Add boost for more aggressive buying
                 
                 if (actualBuyPrice !== buyPrice && config.debug) {
-                    logger.debug(`📊 Using actual fill price ${actualBuyPrice.toFixed(4)} (vs limit ${buyPrice.toFixed(4)}) for dynamic threshold`);
+                    logger.debug(`📊 使用实际成交价 ${actualBuyPrice.toFixed(4)} (vs 限价 ${buyPrice.toFixed(4)}) 计算动态阈值`);
                 }
 
                 // Ensure threshold meets $1 minimum order requirement
@@ -1235,32 +1279,32 @@ export class CopytradeArbBot {
                 tracking.secondSideTimerSessionStart = null;
                 tracking.secondSideTimerAccumulated = 0; // Reset time tracking when switching to new side
 
-                logger.info(`🔄 Switched tracking: ${currentToken} → ${oppositeToken}`);
+                logger.info(`🔄 已切换跟踪: ${currentToken} → ${oppositeToken}`);
                 // PERFORMANCE OPTIMIZATION: Only log detailed threshold calculation when DEBUG enabled
                 if (config.debug) {
                     logger.info(
-                        `📊 Dynamic threshold (next side): 1 - ${buyPrice.toFixed(4)} = ${dynamicThreshold.toFixed(4)} ` +
-                        `(will buy ${oppositeToken} immediately when price <= ${(dynamicThreshold - this.cfg.secondSideBuffer).toFixed(4)} = ${dynamicThreshold.toFixed(4)} - ${this.cfg.secondSideBuffer.toFixed(4)} buffer)`
+                        `📊 动态阈值 (下一边): 1 - ${buyPrice.toFixed(4)} = ${dynamicThreshold.toFixed(4)} ` +
+                        `(当价格 <= ${(dynamicThreshold - this.cfg.secondSideBuffer).toFixed(4)} = ${dynamicThreshold.toFixed(4)} - ${this.cfg.secondSideBuffer.toFixed(4)} 缓冲时立即买入 ${oppositeToken})`
                     );
                     if (wasClampedToMin) {
                         const minOrderValue = (calculatedTempPrice + estimatedPriceBuffer) * this.cfg.sharesPerSide;
                         logger.info(
-                            `⚠️ Threshold adjusted for $1 minimum order: ${dynamicThreshold.toFixed(4)} → ${calculatedTempPrice.toFixed(4)} ` +
-                            `(min threshold: ${minAcceptableThreshold.toFixed(4)} to ensure order value ≥ $1, ` +
-                            `estimated order value: $${minOrderValue.toFixed(2)} = (${calculatedTempPrice.toFixed(4)} + ${estimatedPriceBuffer.toFixed(4)}) × ${this.cfg.sharesPerSide})`
+                            `⚠️ 阈值已调整为满足 $1 最小订单: ${dynamicThreshold.toFixed(4)} → ${calculatedTempPrice.toFixed(4)} ` +
+                            `(最小阈值: ${minAcceptableThreshold.toFixed(4)} 以确保订单价值 ≥ $1, ` +
+                            `预估订单价值: $${minOrderValue.toFixed(2)} = (${calculatedTempPrice.toFixed(4)} + ${estimatedPriceBuffer.toFixed(4)}) × ${this.cfg.sharesPerSide})`
                         );
                     } else if (wasClampedToMax) {
-                        logger.info(`⚠️ Threshold clamped to max: ${dynamicThreshold.toFixed(4)} → ${calculatedTempPrice.toFixed(4)}`);
+                        logger.info(`⚠️ 阈值已限制为最大值: ${dynamicThreshold.toFixed(4)} → ${calculatedTempPrice.toFixed(4)}`);
                     }
-                    logger.info(`🎯 New tracking price for ${oppositeToken}: ${calculatedTempPrice.toFixed(4)} (immediate buy trigger: <= ${(calculatedTempPrice - this.cfg.secondSideBuffer).toFixed(4)})`);
+                    logger.info(`🎯 ${oppositeToken} 的新跟踪价格: ${calculatedTempPrice.toFixed(4)} (立即买入触发: <= ${(calculatedTempPrice - this.cfg.secondSideBuffer).toFixed(4)})`);
                 } else {
-                    logger.success(`🎯 DYNAMIC THRESHOLD: ${dynamicThreshold.toFixed(4)} | Will buy ${oppositeToken} when <= ${(dynamicThreshold - this.cfg.secondSideBuffer).toFixed(4)}`);
+                    logger.success(`🎯 动态阈值: ${dynamicThreshold.toFixed(4)} | 当价格 <= ${(dynamicThreshold - this.cfg.secondSideBuffer).toFixed(4)} 时将买入 ${oppositeToken}`);
                 }
             }
             if (!buySucceeded) {
                 // Buy failed - switch to opposite token
                 if (oppositeBuyCount >= this.cfg.maxBuysPerSide) {
-                    logger.warn(`⚠️ Buy failed for ${currentToken} and opposite ${oppositeToken} is maxed (${oppositeBuyCount}/${this.cfg.maxBuysPerSide}). Stopping tracking.`);
+                    logger.warn(`⚠️ ${currentToken} 买入失败，且对边 ${oppositeToken} 已达到上限 (${oppositeBuyCount}/${this.cfg.maxBuysPerSide})。停止跟踪。`);
                     tracking.trackingToken = null;
                     tracking.initialized = false;
                     tracking.secondSideTimerSessionStart = null;
@@ -1292,8 +1336,8 @@ export class CopytradeArbBot {
             this.lastOpportunityTime = opportunityDetectedAt;
             const discountPercent = ((tracking.tempPrice - currentPrice) / tracking.tempPrice * 100).toFixed(2);
             logger.success(
-                `🎯 SECOND BUY (Depth-based): ${currentToken} @ ${currentPrice.toFixed(4)} | Dropped ${discountPercent}% below tempPrice (${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)}, threshold: ${(this.cfg.depthBuyDiscountPercent * 100).toFixed(1)}%) ` +
-                `attempt_count=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
+                `🎯 第二次买入 (基于深度): ${currentToken} @ ${currentPrice.toFixed(4)} | 比临时价格下跌 ${discountPercent}% (${tracking.tempPrice.toFixed(4)} → ${currentPrice.toFixed(4)}, 阈值: ${(this.cfg.depthBuyDiscountPercent * 100).toFixed(1)}%) ` +
+                `尝试次数=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
             );
 
             // Get state before buy to check if it succeeded
@@ -1342,13 +1386,13 @@ export class CopytradeArbBot {
                     tracking.firstBuyOfHedge = false;
                     // Clear reset log tracking for this slug - new hedge has started
                     this.hedgeResetLoggedSlugs.delete(slug);
-                    logger.success(`🎯 FIRST BUY: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | Hedge started`);
+                    logger.success(`🎯 首次买入: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | 对冲已开始`);
                 }
                 
                 const dynamicThreshold = 1 - actualBuyPrice + this.cfg.dynamicThresholdBoost; // Add boost for more aggressive buying
                 
                 if (actualBuyPrice !== buyPrice && config.debug) {
-                    logger.debug(`📊 Using actual fill price ${actualBuyPrice.toFixed(4)} (vs limit ${buyPrice.toFixed(4)}) for dynamic threshold`);
+                    logger.debug(`📊 使用实际成交价 ${actualBuyPrice.toFixed(4)} (vs 限价 ${buyPrice.toFixed(4)}) 计算动态阈值`);
                 }
 
                 // Ensure threshold meets $1 minimum order requirement
@@ -1376,7 +1420,7 @@ export class CopytradeArbBot {
                 tracking.secondSideTimerSessionStart = null;
                 tracking.secondSideTimerAccumulated = 0; // Reset time tracking when switching to new side
 
-                logger.info(`🔄 Switched tracking: ${currentToken} → ${oppositeToken}`);
+                logger.info(`🔄 已切换跟踪: ${currentToken} → ${oppositeToken}`);
                 // PERFORMANCE OPTIMIZATION: Only log detailed threshold calculation when DEBUG enabled
                 if (config.debug) {
                     logger.info(
@@ -1401,7 +1445,7 @@ export class CopytradeArbBot {
             if (!buySucceeded) {
                 // Buy failed - switch to opposite token
                 if (oppositeBuyCount >= this.cfg.maxBuysPerSide) {
-                    logger.warn(`⚠️ Buy failed for ${currentToken} and opposite ${oppositeToken} is maxed (${oppositeBuyCount}/${this.cfg.maxBuysPerSide}). Stopping tracking.`);
+                    logger.warn(`⚠️ ${currentToken} 买入失败，且对边 ${oppositeToken} 已达到上限 (${oppositeBuyCount}/${this.cfg.maxBuysPerSide})。停止跟踪。`);
                     tracking.trackingToken = null;
                     tracking.initialized = false;
                 } else {
@@ -1430,11 +1474,11 @@ export class CopytradeArbBot {
             this.lastOpportunityTime = opportunityDetectedAt;
             // Check if this is the second side buy (firstBuyOfHedge is false)
             const isSecondSideBuy = !tracking.firstBuyOfHedge;
-            const buySideLabel = isSecondSideBuy ? "🎯 SECOND BUY" : "⚡ BUY TRIGGER (Reversal)";
+            const buySideLabel = isSecondSideBuy ? "🎯 第二次买入" : "⚡ 买入触发 (反转)";
             logger.success(
                 `${buySideLabel}: ${currentToken} @ ${currentPrice.toFixed(4)} ` +
-                `(reversed from ${tracking.tempPrice.toFixed(4)}, movement=+${actualPriceMovement.toFixed(4)}, threshold=${reversalThreshold.toFixed(4)}) ` +
-                `attempt_count=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
+                `(从 ${tracking.tempPrice.toFixed(4)} 反转, 变动=+${actualPriceMovement.toFixed(4)}, 阈值=${reversalThreshold.toFixed(4)}) ` +
+                `尝试次数=${attemptCount + 1}/${this.cfg.maxBuysPerSide}`
             );
 
             // Get state before buy to check if it succeeded
@@ -1485,13 +1529,13 @@ export class CopytradeArbBot {
                     tracking.firstBuyOfHedge = false;
                     // Clear reset log tracking for this slug - new hedge has started
                     this.hedgeResetLoggedSlugs.delete(slug);
-                    logger.success(`🎯 FIRST BUY: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | Hedge started`);
+                    logger.success(`🎯 首次买入: ${currentToken} @ ${actualBuyPrice.toFixed(4)} | 对冲已开始`);
                 }
                 
                 const dynamicThreshold = 1 - actualBuyPrice + this.cfg.dynamicThresholdBoost; // Add boost for more aggressive buying
                 
                 if (actualBuyPrice !== buyPrice && config.debug) {
-                    logger.debug(`📊 Using actual fill price ${actualBuyPrice.toFixed(4)} (vs limit ${buyPrice.toFixed(4)}) for dynamic threshold`);
+                    logger.debug(`📊 使用实际成交价 ${actualBuyPrice.toFixed(4)} (vs 限价 ${buyPrice.toFixed(4)}) 计算动态阈值`);
                 }
 
                 // Ensure threshold meets $1 minimum order requirement
@@ -1526,7 +1570,7 @@ export class CopytradeArbBot {
                 tracking.secondSideTimerAccumulated = 0; // Reset time tracking when switching to new side
 
                 // Enhanced logging with formula breakdown
-                logger.info(`🔄 Switched tracking: ${currentToken} → ${oppositeToken}`);
+                logger.info(`🔄 已切换跟踪: ${currentToken} → ${oppositeToken}`);
                 // PERFORMANCE OPTIMIZATION: Only log detailed threshold calculation when DEBUG enabled
                 if (config.debug) {
                     logger.info(
@@ -1554,7 +1598,7 @@ export class CopytradeArbBot {
                 // If opposite side is maxed out, we'll skip in next tick
                 if (oppositeBuyCount >= this.cfg.maxBuysPerSide) {
                     // Opposite side already maxed, can't buy more - stop tracking
-                    logger.warn(`⚠️ Buy failed for ${currentToken} and opposite ${oppositeToken} is maxed (${oppositeBuyCount}/${this.cfg.maxBuysPerSide}). Stopping tracking.`);
+                    logger.warn(`⚠️ ${currentToken} 买入失败，且对边 ${oppositeToken} 已达到上限 (${oppositeBuyCount}/${this.cfg.maxBuysPerSide})。停止跟踪。`);
                     tracking.trackingToken = null;
                     tracking.initialized = false;
                 } else {
@@ -1619,7 +1663,7 @@ export class CopytradeArbBot {
         const limitPrice = roundDownToTick(mid + priceBuffer, this.cfg.tickSize);
 
         if (!(limitPrice > 0 && limitPrice < 1)) {
-            logger.warn(`Copytrade: market=${market} slug=${slug} invalid limit price ${limitPrice} for leg=${leg}`);
+            logger.warn(`套利: 市场=${market} slug=${slug} 无效限价 ${limitPrice} 边=${leg}`);
             return null;
         }
 
@@ -1633,8 +1677,8 @@ export class CopytradeArbBot {
             adjustedSize = minSharesNeeded;
             const adjustedOrderValue = limitPrice * adjustedSize;
             logger.info(
-                `💰 Adjusted shares to meet $1 minimum: ${size} → ${adjustedSize} shares ` +
-                `(order value: $${orderValue.toFixed(2)} → $${adjustedOrderValue.toFixed(2)} at price=${limitPrice.toFixed(4)})`
+                `💰 已调整份额以满足 $1 最小值: ${size} → ${adjustedSize} 份额 ` +
+                `(订单价值: $${orderValue.toFixed(2)} → $${adjustedOrderValue.toFixed(2)} 价格=${limitPrice.toFixed(4)})`
             );
         }
 
@@ -1654,9 +1698,9 @@ export class CopytradeArbBot {
 
         if (projectedSumAvg > this.cfg.maxSumAvg) {
             logger.warn(
-                `Copytrade: market=${market} slug=${slug} skipping ${leg} buy at ${limitPrice.toFixed(4)} - ` +
-                `would make sumAvg ${projectedSumAvg.toFixed(4)} > ${this.cfg.maxSumAvg} (unprofitable). ` +
-                `Current: avgYES=${avg(row.costYES, row.qtyYES).toFixed(4)} avgNO=${avg(row.costNO, row.qtyNO).toFixed(4)}`
+                `套利: 市场=${market} slug=${slug} 跳过 ${leg} 买入 价格=${limitPrice.toFixed(4)} - ` +
+                `会使总平均 ${projectedSumAvg.toFixed(4)} > ${this.cfg.maxSumAvg} (无利可图)。 ` +
+                `当前: 平均YES=${avg(row.costYES, row.qtyYES).toFixed(4)} 平均NO=${avg(row.costNO, row.qtyNO).toFixed(4)}`
             );
             // return null;
         }
@@ -1675,8 +1719,59 @@ export class CopytradeArbBot {
         const orderTypeStr = this.cfg.useFakOrders ? "GTC (aggressive pricing for speed)" : "GTC (Good-Till-Cancel)";
 
         const orderStartTime = Date.now();
+
+        // =====================
+        // SIMULATION MODE: do not place real order
+        // =====================
+        if (this.isSimulation) {
+            const tokensReceived = finalSize;
+            const usdcSpent = tokensReceived * limitPrice;
+
+            // Update simulated balances and metrics
+            this.metrics.totalOrders++;
+            this.metrics.successfulOrders++;
+            this.metrics.totalSpent += usdcSpent;
+            this.metrics.totalReceived += tokensReceived;
+            this.metrics.simCurrentBalance -= usdcSpent;
+
+            // Update state row (same as real fill path)
+            row.market = market;
+            row.slug = slug;
+            row.conditionId = conditionId;
+            row.upIdx = upIdx;
+            row.downIdx = downIdx;
+            if (leg === "YES") {
+                row.qtyYES += tokensReceived;
+                row.costYES += usdcSpent;
+                row.buyCountYES += 1;
+                row.lastBuySide = "YES";
+            } else {
+                row.qtyNO += tokensReceived;
+                row.costNO += usdcSpent;
+                row.buyCountNO += 1;
+                row.lastBuySide = "NO";
+            }
+            row.buysCount += 1;
+            row.lastUpdatedIso = new Date().toISOString();
+            state[key] = row;
+            saveState(state);
+
+            const avgYes = avg(row.costYES, row.qtyYES);
+            const avgNo = avg(row.costNO, row.qtyNO);
+            const currentSumAvg = avgYes + avgNo;
+            this.metrics.avgSumAvg += currentSumAvg;
+            this.metrics.sumAvgSamples++;
+
+            logger.success(
+                `⚡ [模拟] 买入 市场=${market} slug=${slug} 边=${leg} 数量=${finalSize}${finalSize !== size ? ` (从 ${size} 调整)` : ''} ` +
+                `价格=${limitPrice.toFixed(4)} 花费=${usdcSpent.toFixed(6)} 平均YES=${avgYes.toFixed(4)} 平均NO=${avgNo.toFixed(4)} 总平均=${currentSumAvg.toFixed(4)}`
+            );
+
+            return limitPrice;
+        }
+
         logger.info(
-            `⚡ Copytrade BUY market=${market} slug=${slug} leg=${leg} size=${finalSize}${finalSize !== size ? ` (adjusted from ${size})` : ''} conditionId=${conditionId} (limit=${limitPrice}, mid=${mid}) type=${orderTypeStr}`
+            `⚡ 套利买入 市场=${market} slug=${slug} 边=${leg} 数量=${finalSize}${finalSize !== size ? ` (从 ${size} 调整)` : ''} conditionId=${conditionId} (限价=${limitPrice}, 中间价=${mid}) 类型=${orderTypeStr}`
         );
 
         let response;
@@ -1685,25 +1780,25 @@ export class CopytradeArbBot {
             const orderOptions = { tickSize: this.cfg.tickSize, negRisk: this.cfg.negRisk };
             response = await this.client.createAndPostOrder(userOrder, orderOptions, orderType);
             const orderPlaceTime = Date.now() - orderPlaceStartTime;
-            logger.info(`⚡ Order placed in ${orderPlaceTime}ms`);
+            logger.info(`⚡ 订单已下单，耗时 ${orderPlaceTime}毫秒`);
             this.metrics.totalOrders++;
         } catch (e) {
             this.metrics.failedOrders++;
             this.metrics.errors++;
             this.metrics.apiErrors++;
-            logger.error(`Copytrade BUY order creation failed market=${market} slug=${slug} leg=${leg}: ${e instanceof Error ? e.message : String(e)}`);
+            logger.error(`套利买入订单创建失败 市场=${market} slug=${slug} 边=${leg}: ${e instanceof Error ? e.message : String(e)}`);
             return null;
         }
 
         const orderID = response?.orderID;
         if (!orderID) {
-            logger.error(`Copytrade BUY failed market=${market} slug=${slug} leg=${leg} - no orderID returned (likely balance/allowance issue)`);
+            logger.error(`套利买入失败 市场=${market} slug=${slug} 边=${leg} - 未返回 orderID (可能是余额/授权问题)`);
             return null;
         }
 
         // Check if we've already processed this order (prevent duplicates)
         if (this.processedOrders.has(orderID)) {
-            logger.warn(`Order ${orderID} already processed, skipping duplicate`);
+            logger.warn(`订单 ${orderID} 已处理，跳过重复`);
             return null;
         }
 
@@ -1713,7 +1808,7 @@ export class CopytradeArbBot {
             this.trackOrderAsync(orderID, leg, tokenID, conditionId, finalSize, limitPrice, state, key, market, slug, upIdx, downIdx);
 
             const totalTime = Date.now() - orderStartTime;
-            logger.success(`⚡ Order ${orderID.substring(0, 20)}... placed and tracking async (total: ${totalTime}ms) - continuing immediately`);
+            logger.success(`⚡ 订单 ${orderID.substring(0, 20)}... 已下单并异步跟踪 (总计: ${totalTime}毫秒) - 立即继续`);
 
             // Return immediately with limit price (assume success for now)
             // Order will be verified asynchronously
@@ -1725,7 +1820,7 @@ export class CopytradeArbBot {
         const initialDelay = this.cfg.orderCheckInitialDelayMs || 100; // Reduced from 500ms
         // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled (reduces log spam)
         if (config.debug) {
-            logger.info(`Waiting ${initialDelay}ms for order to be matched...`);
+            logger.info(`等待 ${initialDelay}毫秒以便订单匹配...`);
         }
         await new Promise(resolve => setTimeout(resolve, initialDelay));
 
@@ -1750,7 +1845,7 @@ export class CopytradeArbBot {
                     if (order.status === "LIVE" && orderCheckAttempts < maxOrderCheckAttempts - 1) {
                         // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled
                         if (config.debug) {
-                            logger.info(`Order status LIVE, waiting ${retryDelay}ms for it to match (attempt ${orderCheckAttempts + 1}/${maxOrderCheckAttempts})...`);
+                            logger.info(`订单状态 LIVE，等待 ${retryDelay}毫秒以便匹配 (尝试 ${orderCheckAttempts + 1}/${maxOrderCheckAttempts})...`);
                         }
                         await new Promise(resolve => setTimeout(resolve, retryDelay));
                         orderCheckAttempts++;
@@ -1764,14 +1859,14 @@ export class CopytradeArbBot {
                 // If order is null/invalid, wait and retry
                 // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled (reduces log spam)
                 if (config.debug) {
-                    logger.warn(`Order status check returned invalid response, attempt ${orderCheckAttempts + 1}/${maxOrderCheckAttempts}, waiting ${retryDelay}ms...`);
+                    logger.warn(`订单状态检查返回无效响应，尝试 ${orderCheckAttempts + 1}/${maxOrderCheckAttempts}，等待 ${retryDelay}毫秒...`);
                 }
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
                 orderCheckAttempts++;
             } catch (e) {
                 // PERFORMANCE OPTIMIZATION: Only log when DEBUG enabled
                 if (config.debug) {
-                    logger.warn(`Order status check failed, attempt ${orderCheckAttempts + 1}/${maxOrderCheckAttempts}: ${e instanceof Error ? e.message : String(e)}, waiting ${retryDelay}ms...`);
+                    logger.warn(`订单状态检查失败，尝试 ${orderCheckAttempts + 1}/${maxOrderCheckAttempts}: ${e instanceof Error ? e.message : String(e)}，等待 ${retryDelay}毫秒...`);
                 }
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
                 orderCheckAttempts++;
@@ -1780,14 +1875,14 @@ export class CopytradeArbBot {
 
         // If we still don't have a valid order after retries, abort
         if (!order || !order.status) {
-            logger.error(`Copytrade BUY failed market=${market} slug=${slug} leg=${leg} orderID=${orderID} - could not verify order status after ${maxOrderCheckAttempts} attempts`);
+            logger.error(`套利买入失败 市场=${market} slug=${slug} 边=${leg} orderID=${orderID} - 尝试 ${maxOrderCheckAttempts} 次后无法验证订单状态`);
             return null;
         }
 
         logger.debug(`Final order status: ${order.status} for ${leg} orderID=${orderID}`);
 
         if (order.status !== "MATCHED") {
-            logger.error(`Copytrade BUY failed market=${market} slug=${slug} leg=${leg} conditionId=${conditionId} orderID=${orderID} status=${order.status} (order may still be on order book)`);
+            logger.error(`套利买入失败 市场=${market} slug=${slug} 边=${leg} conditionId=${conditionId} orderID=${orderID} 状态=${order.status} (订单可能仍在订单簿上)`);
         }
 
         const tokensReceived = response?.takingAmount ? parseFloat(response.takingAmount) : finalSize;
@@ -1850,9 +1945,9 @@ export class CopytradeArbBot {
 
         const totalTime = Date.now() - orderStartTime;
         logger.success(
-            `⚡ Copytrade BUY done market=${market} slug=${slug} leg=${leg} conditionId=${conditionId} orderID=${response?.orderID || "N/A"} filled=${tokensReceived} spent=${usdcSpent.toFixed(
+            `⚡ 套利买入完成 市场=${market} slug=${slug} 边=${leg} conditionId=${conditionId} orderID=${response?.orderID || "N/A"} 成交=${tokensReceived} 花费=${usdcSpent.toFixed(
                 6
-            )} avgYES=${avgYes.toFixed(4)} avgNO=${avgNo.toFixed(4)} sumAvg=${currentSumAvg.toFixed(4)} totalTime=${totalTime}ms`
+            )} 平均YES=${avgYes.toFixed(4)} 平均NO=${avgNo.toFixed(4)} 总平均=${currentSumAvg.toFixed(4)} 总耗时=${totalTime}毫秒`
         );
 
         // Return the actual buy price (limitPrice) for dynamic threshold calculation

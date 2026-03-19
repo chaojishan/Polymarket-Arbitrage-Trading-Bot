@@ -98,11 +98,11 @@ export async function approveUSDCAllowance(): Promise<void> {
     const wallet = new Wallet(privateKey, provider);
     
     const address = await wallet.getAddress();
-    logger.info(`Approving USDC allowances for address: ${address}, chainId: ${chainId}`);
+    logger.info(`正在为地址批准 USDC 授权: ${address}, 链ID: ${chainId}`);
     logger.info(`RPC: ${rpcUrl}`);
-    logger.info(`USDC Contract: ${contractConfig.collateral}`);
-    logger.info(`ConditionalTokens Contract: ${contractConfig.conditionalTokens}`);
-    logger.info(`Exchange Contract: ${contractConfig.exchange}`);
+    logger.info(`USDC 合约: ${contractConfig.collateral}`);
+    logger.info(`ConditionalTokens 合约: ${contractConfig.conditionalTokens}`);
+    logger.info(`Exchange 合约: ${contractConfig.exchange}`);
 
     // Create USDC contract instance
     const usdcContract = new Contract(contractConfig.collateral, USDC_ABI, wallet);
@@ -116,7 +116,7 @@ export async function approveUSDCAllowance(): Promise<void> {
             gasLimit: 200_000,
         };
     } catch (error) {
-        logger.warn("Could not fetch gas price, using fallback");
+        logger.warn("无法获取 gas 价格，使用备用值");
         gasOptions = {
             gasPrice: parseUnits("100", "gwei"),
             gasLimit: 200_000,
@@ -126,25 +126,25 @@ export async function approveUSDCAllowance(): Promise<void> {
     // Check and approve USDC for ConditionalTokens contract
     const ctfAllowance = await usdcContract.allowance(address, contractConfig.conditionalTokens);
     if (!ctfAllowance.eq(MaxUint256)) {
-        logger.info(`Current CTF allowance: ${ctfAllowance.toString()}, setting to MaxUint256...`);
+        logger.info(`当前 CTF 授权: ${ctfAllowance.toString()}, 正在设置为 MaxUint256...`);
         const tx = await usdcContract.approve(contractConfig.conditionalTokens, MaxUint256, gasOptions);
-        logger.info(`Transaction hash: ${tx.hash}`);
+        logger.info(`交易哈希: ${tx.hash}`);
         await tx.wait();
-        logger.success("✅ USDC approved for ConditionalTokens contract");
+        logger.success("✅ USDC 已批准用于 ConditionalTokens 合约");
     } else {
-        logger.info("✅ USDC already approved for ConditionalTokens contract (MaxUint256)");
+        logger.info("✅ USDC 已批准用于 ConditionalTokens 合约 (MaxUint256)");
     }
 
     // Check and approve USDC for Exchange contract
     const exchangeAllowance = await usdcContract.allowance(address, contractConfig.exchange);
     if (!exchangeAllowance.eq(MaxUint256)) {
-        logger.info(`Current Exchange allowance: ${exchangeAllowance.toString()}, setting to MaxUint256...`);
+        logger.info(`当前 Exchange 授权: ${exchangeAllowance.toString()}, 正在设置为 MaxUint256...`);
         const tx = await usdcContract.approve(contractConfig.exchange, MaxUint256, gasOptions);
-        logger.info(`Transaction hash: ${tx.hash}`);
+        logger.info(`交易哈希: ${tx.hash}`);
         await tx.wait();
-        logger.success("✅ USDC approved for Exchange contract");
+        logger.success("✅ USDC 已批准用于 Exchange 合约");
     } else {
-        logger.info("✅ USDC already approved for Exchange contract (MaxUint256)");
+        logger.info("✅ USDC 已批准用于 Exchange 合约 (MaxUint256)");
     }
 
     // Check and approve ConditionalTokens (ERC1155) for Exchange contract
@@ -152,13 +152,13 @@ export async function approveUSDCAllowance(): Promise<void> {
     const isApproved = await ctfContract.isApprovedForAll(address, contractConfig.exchange);
     
     if (!isApproved) {
-        logger.info("Approving ConditionalTokens for Exchange contract...");
+        logger.info("正在批准 ConditionalTokens 用于 Exchange 合约...");
         const tx = await ctfContract.setApprovalForAll(contractConfig.exchange, true, gasOptions);
-        logger.info(`Transaction hash: ${tx.hash}`);
+        logger.info(`交易哈希: ${tx.hash}`);
         await tx.wait();
-        logger.success("✅ ConditionalTokens approved for Exchange contract");
+        logger.success("✅ ConditionalTokens 已批准用于 Exchange 合约");
     } else {
-        logger.info("✅ ConditionalTokens already approved for Exchange contract");
+        logger.info("✅ ConditionalTokens 已批准用于 Exchange 合约");
     }
 
     // If negRisk is enabled, also approve for negRisk contracts
@@ -167,45 +167,45 @@ export async function approveUSDCAllowance(): Promise<void> {
         // Approve USDC for NegRiskAdapter
         const negRiskAdapterAllowance = await usdcContract.allowance(address, contractConfig.negRiskAdapter);
         if (!negRiskAdapterAllowance.eq(MaxUint256)) {
-            logger.info(`Current NegRiskAdapter allowance: ${negRiskAdapterAllowance.toString()}, setting to MaxUint256...`);
+            logger.info(`当前 NegRiskAdapter 授权: ${negRiskAdapterAllowance.toString()}, 正在设置为 MaxUint256...`);
             const tx = await usdcContract.approve(contractConfig.negRiskAdapter, MaxUint256, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
+            logger.info(`交易哈希: ${tx.hash}`);
             await tx.wait();
-            logger.success("✅ USDC approved for NegRiskAdapter");
+            logger.success("✅ USDC 已批准用于 NegRiskAdapter");
         }
 
         // Approve USDC for NegRiskExchange
         const negRiskExchangeAllowance = await usdcContract.allowance(address, contractConfig.negRiskExchange);
         if (!negRiskExchangeAllowance.eq(MaxUint256)) {
-            logger.info(`Current NegRiskExchange allowance: ${negRiskExchangeAllowance.toString()}, setting to MaxUint256...`);
+            logger.info(`当前 NegRiskExchange 授权: ${negRiskExchangeAllowance.toString()}, 正在设置为 MaxUint256...`);
             const tx = await usdcContract.approve(contractConfig.negRiskExchange, MaxUint256, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
+            logger.info(`交易哈希: ${tx.hash}`);
             await tx.wait();
-            logger.success("✅ USDC approved for NegRiskExchange");
+            logger.success("✅ USDC 已批准用于 NegRiskExchange");
         }
 
         // Approve ConditionalTokens for NegRiskExchange
         const isNegRiskApproved = await ctfContract.isApprovedForAll(address, contractConfig.negRiskExchange);
         if (!isNegRiskApproved) {
-            logger.info("Approving ConditionalTokens for NegRiskExchange...");
+            logger.info("正在批准 ConditionalTokens 用于 NegRiskExchange...");
             const tx = await ctfContract.setApprovalForAll(contractConfig.negRiskExchange, true, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
+            logger.info(`交易哈希: ${tx.hash}`);
             await tx.wait();
-            logger.success("✅ ConditionalTokens approved for NegRiskExchange");
+            logger.success("✅ ConditionalTokens 已批准用于 NegRiskExchange");
         }
 
         // Approve ConditionalTokens for NegRiskAdapter
         const isNegRiskAdapterApproved = await ctfContract.isApprovedForAll(address, contractConfig.negRiskAdapter);
         if (!isNegRiskAdapterApproved) {
-            logger.info("Approving ConditionalTokens for NegRiskAdapter...");
+            logger.info("正在批准 ConditionalTokens 用于 NegRiskAdapter...");
             const tx = await ctfContract.setApprovalForAll(contractConfig.negRiskAdapter, true, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
+            logger.info(`交易哈希: ${tx.hash}`);
             await tx.wait();
-            logger.success("✅ ConditionalTokens approved for NegRiskAdapter");
+            logger.success("✅ ConditionalTokens 已批准用于 NegRiskAdapter");
         }
     }
 
-    logger.success("All allowances approved successfully!");
+    logger.success("所有授权已成功批准！");
 }
 
 /**
@@ -214,11 +214,11 @@ export async function approveUSDCAllowance(): Promise<void> {
  */
 export async function updateClobBalanceAllowance(client: ClobClient): Promise<void> {
     try {
-        logger.info("Updating CLOB API balance allowance for USDC...");
+        logger.info("正在更新 CLOB API 的 USDC 余额授权...");
         await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        logger.success("✅ CLOB API balance allowance updated for USDC");
+        logger.success("✅ CLOB API 的 USDC 余额授权已更新");
     } catch (error) {
-        logger.error(`Failed to update CLOB balance allowance: ${error instanceof Error ? error.message : String(error)}`);
+        logger.error(`更新 CLOB 余额授权失败: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
     }
 }
@@ -261,11 +261,11 @@ export async function approveTokensAfterBuy(): Promise<void> {
     const isApproved = await ctfContract.isApprovedForAll(address, contractConfig.exchange);
     
     if (!isApproved) {
-        logger.info("Approving ConditionalTokens for Exchange (after buy)...");
+        logger.info("正在批准 ConditionalTokens 用于 Exchange (买入后)...");
         const tx = await ctfContract.setApprovalForAll(contractConfig.exchange, true, gasOptions);
-        logger.info(`Transaction hash: ${tx.hash}`);
+        logger.info(`交易哈希: ${tx.hash}`);
         await tx.wait();
-        logger.success("✅ ConditionalTokens approved for Exchange");
+        logger.success("✅ ConditionalTokens 已批准用于 Exchange");
     }
 
     // If negRisk is enabled, also check negRisk contracts
@@ -273,11 +273,11 @@ export async function approveTokensAfterBuy(): Promise<void> {
     if (negRisk) {
         const isNegRiskApproved = await ctfContract.isApprovedForAll(address, contractConfig.negRiskExchange);
         if (!isNegRiskApproved) {
-            logger.info("Approving ConditionalTokens for NegRiskExchange (after buy)...");
+            logger.info("正在批准 ConditionalTokens 用于 NegRiskExchange (买入后)...");
             const tx = await ctfContract.setApprovalForAll(contractConfig.negRiskExchange, true, gasOptions);
-            logger.info(`Transaction hash: ${tx.hash}`);
+            logger.info(`交易哈希: ${tx.hash}`);
             await tx.wait();
-            logger.success("✅ ConditionalTokens approved for NegRiskExchange");
+            logger.success("✅ ConditionalTokens 已批准用于 NegRiskExchange");
         }
     }
 }

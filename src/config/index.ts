@@ -111,6 +111,9 @@ export const config = {
         orderCheckMaxAttempts: envNumber("TRADE_ORDER_MAX_ATTEMPTS", 2), // Max order check attempts (reduced from 3)
         // State management
         cleanupOldStateDays: envNumber("TRADE_CLEANUP_STATE_DAYS", 1), // Clean up state older than N days
+        // Simulation / paper-trading mode
+        simulate: envBool("TRADE_SIMULATE", true), // Enable paper trading (do not place real orders)
+        simInitialBalanceUsdc: envNumber("TRADE_SIM_INITIAL_BALANCE_USDC", 1_000), // Starting virtual balance for simulation
     },
 
     /** Redeem script args via env */

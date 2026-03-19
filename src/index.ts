@@ -31,80 +31,85 @@ async function waitForNextMarketStart(): Promise<void> {
     const ms = msUntilNext15mBoundary();
     if (ms <= 0) return;
     logger.info(
-        `Waiting for next 15m market start: ${Math.ceil(ms / 1000)}s (start at next boundary)`
+        `等待下一个15分钟市场开始: ${Math.ceil(ms / 1000)}秒 (在下一个边界开始)`
     );
     await new Promise((resolve) => setTimeout(resolve, ms));
-    logger.success("Next 15m market started — starting bot now");
+    logger.success("下一个15分钟市场已开始 — 现在启动机器人");
 }
 
 async function waitMs(ms: number, label: string): Promise<void> {
     if (!(ms > 0)) return;
-    logger.info(`Waiting ${Math.ceil(ms / 1000)}s ${label}...`);
+    logger.info(`等待 ${Math.ceil(ms / 1000)}秒 ${label}...`);
     await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function main() {
-    logger.info("Starting the bot...");
+    logger.info("正在启动机器人...");
 
     // Create credentials if they don't exist
     const credential = await createCredential();
     if (credential) {
-        logger.info("Credentials ready");
+        logger.info("凭证已就绪");
     }
 
     const clobClient = await getClobClient();
+    const isSimulation = config.copytrade.simulate;
 
-    // Approve USDC allowances to Polymarket contracts
+    // Approve USDC allowances to Polymarket contracts (skip in simulation mode)
     if (clobClient) {
-        try {
-            logger.info("Approving USDC allowances to Polymarket contracts...");
-            await approveUSDCAllowance();
+        if (isSimulation) {
+            logger.info("🧪 [模拟模式] 跳过 USDC 授权批准和余额检查");
+        } else {
+            try {
+                logger.info("正在批准 USDC 授权到 Polymarket 合约...");
+                await approveUSDCAllowance();
 
-            // Update CLOB API to sync with on-chain allowances
-            logger.info("Syncing allowances with CLOB API...");
-            await updateClobBalanceAllowance(clobClient);
-        } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            const code = (error as { code?: string })?.code;
-            const isInsufficientFunds =
-                code === "INSUFFICIENT_FUNDS" ||
-                /insufficient funds/i.test(msg);
-            if (isInsufficientFunds) {
-                logger.error("INSUFFICIENT_FUNDS: Your wallet has no POL (MATIC) for gas.");
-                logger.error("Add POL to your wallet on Polygon to run this bot: https://polygonscan.com/address/YOUR_WALLET");
-                logger.warn("Continuing without allowances - orders may fail until you fund the wallet.");
-            } else {
-                logger.error("Failed to approve USDC allowances", error);
-                logger.warn("Continuing without allowances - orders may fail");
+                // Update CLOB API to sync with on-chain allowances
+                logger.info("正在同步授权到 CLOB API...");
+                await updateClobBalanceAllowance(clobClient);
+            } catch (error: unknown) {
+                const msg = error instanceof Error ? error.message : String(error);
+                const code = (error as { code?: string })?.code;
+                const isInsufficientFunds =
+                    code === "INSUFFICIENT_FUNDS" ||
+                    /insufficient funds/i.test(msg);
+                if (isInsufficientFunds) {
+                    logger.error("资金不足: 您的钱包没有 POL (MATIC) 用于支付 gas 费。");
+                    logger.error("请在 Polygon 上为您的钱包添加 POL 以运行此机器人: https://polygonscan.com/address/YOUR_WALLET");
+                    logger.warn("继续运行但不授权 - 在您为钱包充值之前订单可能会失败。");
+                } else {
+                    logger.error("批准 USDC 授权失败", error);
+                    logger.warn("继续运行但不授权 - 订单可能会失败");
+                }
             }
-        }
 
-        // Validation gate: proceed only once available USDC balance is >= $1
-        const { ok, available, allowance, balance } = await waitForMinimumUsdcBalance(clobClient, config.bot.minUsdcBalance, {
-            pollIntervalMs: 15_000,
-            timeoutMs: 0, // wait indefinitely
-            logEveryPoll: true,
-        });
-        logger.info(
-            `waitForMinimumUsdcBalance ==> ok=${ok} available=${available} allowance=${allowance} balance=${balance}`
-        );
-        logger.success("Wallet is funded");
+            // Validation gate: proceed only once available USDC balance is >= $1
+            const { ok, available, allowance, balance } = await waitForMinimumUsdcBalance(clobClient, config.bot.minUsdcBalance, {
+                pollIntervalMs: 15_000,
+                timeoutMs: 0, // wait indefinitely
+                logEveryPoll: true,
+            });
+            logger.info(
+                `等待最小 USDC 余额 ==> 通过=${ok} 可用=${available} 授权=${allowance} 余额=${balance}`
+            );
+            logger.success("钱包已充值");
+        }
         // Next step:
         if (config.bot.waitForNextMarketStart) {
             await waitForNextMarketStart();
         } else {
-            logger.info("Skipping wait for next 15m market start (resume immediately from state)");
+            logger.info("跳过等待下一个15分钟市场开始 (立即从状态恢复)");
         }
         // Delay trading start to allow previous market to become redeemable (~200s) and be redeemed by worker.
         const copytrade = CopytradeArbBot.fromEnv(clobClient);
         copytrade.start();
     } else {
-        logger.error("Failed to initialize CLOB client - cannot continue");
+        logger.error("初始化 CLOB 客户端失败 - 无法继续");
         return;
     }
 }
 
 main().catch((error) => {
-    logger.error("Fatal error", error);
+    logger.error("致命错误", error);
     process.exit(1);
 });

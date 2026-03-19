@@ -48,13 +48,13 @@ export async function getAvailableBalance(
         const availableBalance = totalBalance - reservedAmount;
 
         logger.debug(
-            `Balance check: Total=${totalBalance}, Reserved=${reservedAmount}, Available=${availableBalance}`
+            `余额检查: 总计=${totalBalance}, 已预留=${reservedAmount}, 可用=${availableBalance}`
         );
 
         return Math.max(0, availableBalance);
     } catch (error) {
         logger.error(
-            `Failed to get available balance: ${error instanceof Error ? error.message : String(error)}`
+            `获取可用余额失败: ${error instanceof Error ? error.message : String(error)}`
         );
         // Return 0 on error to be safe
         return 0;
@@ -74,16 +74,16 @@ export async function displayWalletBalance(client: ClobClient): Promise<{ balanc
         const allowance = parseFloat(balanceResponse.allowance || "0");
 
         logger.info("═══════════════════════════════════════");
-        logger.info("💰 WALLET BALANCE & ALLOWANCE");
+        logger.info("💰 钱包余额和授权");
         logger.info("═══════════════════════════════════════");
-        logger.info(`USDC Balance: ${balance.toFixed(6)}`);
-        logger.info(`USDC Allowance: ${allowance.toFixed(6)}`);
-        logger.info(`Available: ${balance.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`);
+        logger.info(`USDC 余额: ${balance.toFixed(6)}`);
+        logger.info(`USDC 授权: ${allowance.toFixed(6)}`);
+        logger.info(`可用: ${balance.toFixed(6)} (余额: ${balance.toFixed(6)}, 授权: ${allowance.toFixed(6)})`);
         logger.info("═══════════════════════════════════════");
 
         return { balance, allowance };
     } catch (error) {
-        logger.error(`Failed to get wallet balance: ${error instanceof Error ? error.message : String(error)}`);
+        logger.error(`获取钱包余额失败: ${error instanceof Error ? error.message : String(error)}`);
         return { balance: 0, allowance: 0 };
     }
 }
@@ -108,18 +108,18 @@ export async function validateBuyOrderBalance(
 
         if (!valid) {
             logger.warn("═══════════════════════════════════════");
-            logger.warn("⚠️  INSUFFICIENT BALANCE/ALLOWANCE");
+            logger.warn("⚠️  余额/授权不足");
             logger.warn("═══════════════════════════════════════");
-            logger.warn(`Required: ${requiredAmount.toFixed(6)} USDC`);
-            logger.warn(`Available: ${available.toFixed(6)} USDC`);
-            logger.warn(`Balance: ${balance.toFixed(6)} USDC`);
-            logger.warn(`Allowance: ${allowance.toFixed(6)} USDC`);
+            logger.warn(`需要: ${requiredAmount.toFixed(6)} USDC`);
+            logger.warn(`可用: ${available.toFixed(6)} USDC`);
+            logger.warn(`余额: ${balance.toFixed(6)} USDC`);
+            logger.warn(`授权: ${allowance.toFixed(6)} USDC`);
             logger.warn("═══════════════════════════════════════");
         }
 
         return { valid, available, required: requiredAmount, balance, allowance };
     } catch (error) {
-        logger.error(`Failed to validate balance: ${error instanceof Error ? error.message : String(error)}`);
+        logger.error(`验证余额失败: ${error instanceof Error ? error.message : String(error)}`);
         const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
         return { valid: false, available, required: requiredAmount };
     }
@@ -138,7 +138,7 @@ export async function validateSellOrderBalance(
 
     if (!valid) {
         logger.warn(
-            `Insufficient token balance: Token=${tokenId.substring(0, 20)}..., Required=${requiredAmount}, Available=${available}`
+            `代币余额不足: 代币=${tokenId.substring(0, 20)}..., 需要=${requiredAmount}, 可用=${available}`
         );
     }
 
@@ -183,38 +183,38 @@ export async function waitForMinimumUsdcBalance(
             const available = (await getAvailableBalance(client, AssetType.COLLATERAL)) / 10 ** 6;
 
             logger.info("═══════════════════════════════════════");
-            logger.info("💰 WALLET BALANCE & ALLOWANCE");
+            logger.info("💰 钱包余额和授权");
             logger.info("═══════════════════════════════════════");
-            logger.info(`USDC Balance: ${balance.toFixed(6)}`);
-            logger.info(`USDC Allowance: ${allowance.toFixed(6)}`);
-            logger.info(`Available: ${balance.toFixed(6)} (Balance: ${balance.toFixed(6)}, Allowance: ${allowance.toFixed(6)})`);
+            logger.info(`USDC 余额: ${balance.toFixed(6)}`);
+            logger.info(`USDC 授权: ${allowance.toFixed(6)}`);
+            logger.info(`可用: ${balance.toFixed(6)} (余额: ${balance.toFixed(6)}, 授权: ${allowance.toFixed(6)})`);
             logger.info("═══════════════════════════════════════");
 
             const ok = available >= minimumUsd;
 
             if (logEveryPoll) {
                 logger.info(
-                    `USDC gate: available=${available.toFixed(6)} (balance=${balance.toFixed(
+                    `USDC 门槛: 可用=${available.toFixed(6)} (余额=${balance.toFixed(
                         6
-                    )}, allowance=${allowance.toFixed(6)}), required>=${minimumUsd}`
+                    )}, 授权=${allowance.toFixed(6)}), 需要>=${minimumUsd}`
                 );
             }
 
             if (ok) {
                 logger.success(
-                    `USDC gate passed: available=${available.toFixed(6)} >= ${minimumUsd}`
+                    `USDC 门槛通过: 可用=${available.toFixed(6)} >= ${minimumUsd}`
                 );
                 return { ok: true, available, balance, allowance };
             }
         } catch (error) {
             logger.warn(
-                `USDC gate check failed: ${error instanceof Error ? error.message : String(error)}`
+                `USDC 门槛检查失败: ${error instanceof Error ? error.message : String(error)}`
             );
         }
 
         if (timeoutMs > 0 && Date.now() - start >= timeoutMs) {
             logger.error(
-                `USDC gate timed out after ${Math.round(timeoutMs / 1000)}s (required>=${minimumUsd})`
+                `USDC 门槛超时，等待了 ${Math.round(timeoutMs / 1000)}秒 (需要>=${minimumUsd})`
             );
             return { ok: false, available: 0, balance: 0, allowance: 0 };
         }
